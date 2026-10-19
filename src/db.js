@@ -6,73 +6,28 @@ function getPool() {
   if (!pool) {
     const url = process.env.DATABASE_URL || process.env.POSTGRES_URL;
     if (!url) throw new Error('DATABASE_URL or POSTGRES_URL missing. Neon database is required for webhook deduplication.');
-    pool = new Pool({ connectionString: url, max: 4, connectionTimeoutMillis: 10000, idleTimeoutMillis: 15000 });
+    pool = new Pool({ connectionString: url, max: 2, connectionTimeoutMillis: 10000, idleTimeoutMillis: 15000 });
   }
   return pool;
 }
 export const query = (sql, args = []) => getPool().query(sql, args);
 
-// Each CREATE is a separate prepared statement; safe for Neon pooled URLs.
-const schema = [
-  `CREATE TABLE IF NOT EXISTS ts_jobs (
-    job_key TEXT PRIMARY KEY, selling_key TEXT NOT NULL, order_id TEXT NOT NULL,
-    order_name TEXT NOT NULL, payload JSONB NOT NULL,
-    state TEXT NOT NULL DEFAULT 'PENDING', attempts INT NOT NULL DEFAULT 0,
-    locked_at TIMESTAMPTZ, last_error TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
-  `CREATE INDEX IF NOT EXISTS ts_jobs_pending ON ts_jobs (state, updated_at)`,
-  `CREATE TABLE IF NOT EXISTS ts_claims (
-    item_key TEXT PRIMARY KEY, job_key TEXT NOT NULL,
-    claimed_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
-  `CREATE TABLE IF NOT EXISTS ts_supplier_orders (
-    job_key TEXT NOT NULL, owner_key TEXT NOT NULL,
-    owner_order_gid TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (job_key, owner_key))`,
-  `CREATE TABLE IF NOT EXISTS ts_logs (
-    id BIGSERIAL PRIMARY KEY, job_key TEXT, level TEXT NOT NULL,
-    message TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now())`,
-  `CREATE INDEX IF NOT EXISTS ts_logs_recent ON ts_logs (created_at DESC)`
-  ,`CREATE TABLE IF NOT EXISTS sb_snapshots (
-    job_key TEXT NOT NULL, item_key TEXT NOT NULL, store_key TEXT NOT NULL,
-    snapshot JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY(job_key,item_key,store_key))`
-  ,`CREATE TABLE IF NOT EXISTS sb_cancellations (
-    job_key TEXT PRIMARY KEY, state TEXT NOT NULL DEFAULT 'PENDING',
-    attempts INT NOT NULL DEFAULT 0, locked_at TIMESTAMPTZ,
-    last_error TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now())`
-  ,`CREATE TABLE IF NOT EXISTS sb_settings (
-    key TEXT PRIMARY KEY, value JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())`
-  ,`CREATE TABLE IF NOT EXISTS sb_sales (
-    store_key TEXT NOT NULL, order_id TEXT NOT NULL, line_id TEXT NOT NULL,
-    order_date TIMESTAMPTZ NOT NULL, sku TEXT NOT NULL DEFAULT '',
-    supplier TEXT, owner_key TEXT, brand TEXT, product_type TEXT,
-    quantity INT NOT NULL DEFAULT 0, gross_value NUMERIC(18,2) NOT NULL DEFAULT 0,
-    currency TEXT NOT NULL DEFAULT 'PKR', cancelled BOOLEAN NOT NULL DEFAULT false,
-    is_internal BOOLEAN NOT NULL DEFAULT false,
-    PRIMARY KEY(store_key,order_id,line_id))`
-  ,`CREATE INDEX IF NOT EXISTS sb_sales_date ON sb_sales (order_date,store_key,owner_key)`
-  ,`CREATE TABLE IF NOT EXISTS sb_inventory (
-    store_key TEXT NOT NULL, variant_id TEXT NOT NULL,
-    sku TEXT NOT NULL DEFAULT '', supplier TEXT, owner_key TEXT, brand TEXT,
-    product_type TEXT, quantity INT NOT NULL DEFAULT 0,
-    price NUMERIC(18,2) NOT NULL DEFAULT 0, currency TEXT NOT NULL DEFAULT 'PKR',
-    status TEXT NOT NULL DEFAULT 'ACTIVE', synced_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY(store_key,variant_id))`
-  ,`CREATE INDEX IF NOT EXISTS sb_inventory_identity ON sb_inventory (supplier,sku,owner_key)`
-  ,`CREATE TABLE IF NOT EXISTS sb_sync (
-    store_key TEXT PRIMARY KEY, cursor TEXT, synced_at TIMESTAMPTZ,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now())`
-  ,`CREATE TABLE IF NOT EXISTS sb_report_cache (
-    cache_key TEXT PRIMARY KEY, result JSONB NOT NULL,
-    fetched_at TIMESTAMPTZ NOT NULL DEFAULT now())`
-
-];
-export function ensureSchema() {
-  if (!initialized) initialized = (async () => {
-    for (const sql of schema) await query(sql);
-  })().catch(err => { initialized = null; throw err; });
+// Schema managed by explicit migration. Never issue concurrent CREATE TABLE in webhook requests.
+export async function ensureSchema() {
+  if (!initialized) initialized = Promise.resolve(true);
   return initialized;
+}
+export async function migrateSchema() {
+  const {readFileSync}=await import('node:fs');
+  const sql=readFileSync(new URL('../sql/migrate.sql',import.meta.url),'utf8');
+  const client=await getPool().connect();
+  try {
+    await client.query('BEGIN');
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('stockbridge-schema-v31'))");
+    await client.query(sql);
+    await client.query('COMMIT');
+  } catch(e) { await client.query('ROLLBACK'); throw e; }
+  finally {client.release();}
 }
 export async function log(jobKey, level, message) {
   await query(`INSERT INTO ts_logs (job_key,level,message) VALUES ($1,$2,$3)`, [jobKey || null,level,String(message).slice(0,1800)]);
@@ -221,4 +176,21 @@ export async function saveCursor(storeKey,cursor) {
 export async function retryV3() {
   const result=await query(`UPDATE sb_cancellations SET state='PENDING',last_error=NULL,updated_at=now() WHERE state='ERROR' RETURNING job_key`);
   return result.rowCount;
+}
+
+export async function saveSalePrice(storeKey,orderId,lineId,priceStore,price,currency){
+ await query(`INSERT INTO sb_sale_prices(store_key,order_id,line_id,price_store_key,unit_price,currency)
+ VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(store_key,order_id,line_id,price_store_key) DO NOTHING`,
+ [storeKey,String(orderId),String(lineId),priceStore,price,currency]);
+}
+export async function recordWebhook(eventId,storeKey,topic,orderId){
+ if(!eventId)return;
+ await query(`INSERT INTO sb_webhook_events(event_id,store_key,topic,order_id)
+ VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`,[eventId,storeKey,topic,String(orderId)]);
+}
+
+// Keep completed stock snapshot current from order webhooks without a Shopify catalog scan.
+export async function updateInventoryCache(storeKey,variantId,quantity,status){
+ await query('UPDATE sb_inventory SET quantity=$3,status=$4,synced_at=now() WHERE store_key=$1 AND variant_id=$2',
+ [storeKey,String(variantId),Number(quantity),String(status)]);
 }

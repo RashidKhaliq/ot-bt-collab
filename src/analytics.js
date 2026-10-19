@@ -1,4 +1,5 @@
-import { getStores, norm } from './config.js';
+import { norm } from './config.js';
+import {loadStores} from './stores.js';
 import * as db from './db.js';
 import {fetchShopifyQL,fetchCatalogPage,graphql} from './shopify.js';
 
@@ -37,7 +38,7 @@ export async function syncCatalog(store, pages=2, reset=false) {
     const batch=await fetchCatalogPage(store,cursor);
     for(const v of batch.nodes) {
       const supplier=v.product?.metafield?.value||'';
-      const owner=getStores().find(s=>norm(s.supplier)===norm(supplier));
+      const owner=(await loadStores()).find(s=>norm(s.supplier)===norm(supplier));
       await db.inventoryUpsert(store.key,{
         variantId:v.id,sku:v.sku,supplier,ownerKey:owner?.key||'',brand:v.product?.brand?.value||'',
         type:v.product?.productType||'',quantity:Math.max(0,Number(v.inventoryQuantity)||0),
@@ -58,7 +59,7 @@ export async function backfillOrders(store,cursor=null,months=12) {
   const data=await graphql(store,`query($q:String!,$cursor:String){orders(first:25,query:$q,after:$cursor,sortKey:CREATED_AT,reverse:false){
     nodes{id name createdAt cancelledAt currencyCode tags lineItems(first:100){nodes{id quantity originalUnitPriceSet{shopMoney{amount}} sku variant{sku product{productType brand:metafield(namespace:"custom",key:"brand"){value} supplier:metafield(namespace:"custom",key:"supplier"){value}}}}}}
     pageInfo{endCursor hasNextPage}}}`,{q:`created_at:>=${since.toISOString().slice(0,10)}`,cursor});
-  const stores=getStores();let imported=0;
+  const stores=await loadStores();let imported=0;
   for(const order of data.orders.nodes){
     const internal=order.tags.some(t=>t==='Dropshipped_Order'||t==='StockBridgeInternal'||t.startsWith('TS_'));
     for(const line of order.lineItems.nodes){
@@ -84,7 +85,7 @@ async function shopReport(store,range,group){
 }
 export async function analytics(input={}) {
   await db.ensureSchema();
-  const stores=getStores();
+  const stores=await loadStores();
   const range=dateRange(input);
   const group=input.group==='brand'?'brand':'type';
   const sellerKey=String(input.selling||'all');const ownerKey=String(input.owner||'all');

@@ -251,3 +251,52 @@ export async function fetchShopifyQL(store,sql) {
   if(data.shopifyqlQuery?.parseErrors?.length)throw new Error('ShopifyQL: '+JSON.stringify(data.shopifyqlQuery.parseErrors));
   return data.shopifyqlQuery?.tableData||{columns:[],rows:[]};
 }
+
+// Shop-scoped subscriptions created with GraphQL are returned by this query.
+// App-scoped TOML subscriptions are not listed by Shopify here; UI labels this clearly.
+export async function getWebhookSubscriptions(store) {
+  const data=await graphql(store,`query{webhookSubscriptions(first:100){nodes{id topic uri}}}`);
+  return data.webhookSubscriptions?.nodes||[];
+}
+export async function ensureWebhookSubscriptions(store, uri) {
+  if(!/^https:\/\/[^\s]+\/api\/webhooks$/.test(uri)) throw new Error('Provide HTTPS PUBLIC_URL; webhook path /api/webhooks required');
+  const topics=['ORDERS_CREATE','ORDERS_CANCELLED'];
+  const existing=await getWebhookSubscriptions(store);
+  const created=[];
+  for(const topic of topics){
+    if(existing.some(s=>s.topic===topic && s.uri===uri))continue;
+    const data=await graphql(store,`mutation($topic:WebhookSubscriptionTopic!,$webhookSubscription:WebhookSubscriptionInput!){
+      webhookSubscriptionCreate(topic:$topic,webhookSubscription:$webhookSubscription){
+        webhookSubscription{id topic uri} userErrors{message field}
+      }
+    }`,{topic,webhookSubscription:{uri}});
+    assertNoUserErrors(data.webhookSubscriptionCreate,'Create webhook '+topic);
+    if(!data.webhookSubscriptionCreate?.webhookSubscription)throw new Error('Shopify did not confirm webhook for '+topic);
+    created.push(topic);
+  }
+  return {created,subscriptions:await getWebhookSubscriptions(store)};
+}
+
+// Read-only Shopify order diagnostics and bounded recovery. No periodic polling.
+const ORDER_FIELDS=`id name createdAt cancelledAt currencyCode tags lineItems(first:50){
+  nodes{id quantity sku originalUnitPriceSet{shopMoney{amount}}
+    variant{id sku}}
+}`;
+function mapShopifyOrder(node) {
+  if(!node)return null;
+  const digits=s=>String(s||'').split('/').pop();
+  return {id:digits(node.id),name:node.name,created_at:node.createdAt,cancelled_at:node.cancelledAt,
+    currency:node.currencyCode,tags:(node.tags||[]).join(', '),
+    line_items:(node.lineItems?.nodes||[]).map(l=>({id:digits(l.id),variant_id:l.variant?digits(l.variant.id):null,
+      sku:l.sku||l.variant?.sku||'',quantity:Number(l.quantity)||0,price:l.originalUnitPriceSet?.shopMoney?.amount||'0'}))};
+}
+export async function recentShopifyOrders(store, limit=10){
+  const data=await graphql(store,`query($first:Int!){orders(first:$first,reverse:true,sortKey:CREATED_AT){nodes{${ORDER_FIELDS}}}}`,{first:Math.min(20,Math.max(1,limit))});
+  return (data.orders?.nodes||[]).map(mapShopifyOrder);
+}
+export async function getShopifyOrder(store,id){
+  if(!/^(?:\d+|gid:\/\/shopify\/Order\/\d+)$/.test(String(id)))throw new Error('Invalid Shopify order id');
+  const gid=String(id).startsWith('gid://')?String(id):`gid://shopify/Order/${id}`;
+  const data=await graphql(store,`query($id:ID!){order(id:$id){${ORDER_FIELDS}}}`,{id:gid});
+  return mapShopifyOrder(data.order);
+}

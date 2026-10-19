@@ -1,193 +1,227 @@
-# StockBridge v3 — Shopify Multi-Store Inventory & Analytics
+# StockBridge v3.1 — Multi-Store Dropshipping & Collaboration Analytics
 
-A Node.js 20+ / Express application for coordinating one-of-a-kind thrift products between independent Shopify stores, with Vercel serverless hosting and Neon PostgreSQL storage. Store examples throughout this repository use **Store A, Store B, Store C and Store D** only.
+Node.js 20+ · Express · Vercel · Neon/PostgreSQL · Shopify Admin GraphQL
 
-## Included features
+**Status:** source-code upgrade. Offline code/syntax and archive validation performed. No access to live Shopify/Neon configuration. **Never deploy live writes until manual integration checks complete.**
 
-- Store connections read securely from environment variables (no API tokens sent to the dashboard).
-- Orders/create and orders/cancelled webhook ingestion, verified against the original raw-body HMAC.
-- SKU + Shopify **product-level** metafield `custom.supplier` owner identification; matched SKU+supplier across participating stores.
-- Customer order on the owning store: mark linked listings sold and synchronize inventory.
-- Customer order on a selling store: place one internal supplier order per owning store, with configurable default **99%** discount and optional free shipping; mark linked listings sold. Internal orders are marked to prevent webhook loops.
-- Safe cancellation workflow using saved product status/tags and inventory location snapshots; cancellation can require manual intervention if stock locations or other claims are ambiguous.
-- Responsive dashboard behind HTTP Basic Auth: Overview, Inventory & Sales Analytics, Dropshipping, Operations and Settings.
-- Sales reporting via lightweight local order ledger and ShopifyQL fallback. Date filters: Today, Yesterday, 7/30/90 days, custom dates; store, owner, product type and brand filters. CSV download.
-- Current inventory stock snapshot, retail valuation and deduplicated physical-item totals when selecting all stores.
-- Optional catalog synchronization and 12-month historical order backfill through bounded API requests.
+## Contents
 
-**Important:** This is a source-code delivery, not a verified production deployment. The JavaScript syntax and archive can be checked offline. A full `npm install`, automated tests, real Shopify API integration tests, and live inventory restoration tests are still required before enabling writes. No Shopify orders or products were changed when creating this ZIP.
+- Shopify `orders/create` + `orders/cancelled` webhooks verified with HMAC per store.
+- Supplier ownership from **product metafield `custom.supplier`**, coupled with exact SKU.
+- Cross-store source identification, inventory draft/zero, idempotent supplier order creation, and configurable supplier-order discount (default **99%**).
+- Cancellation snapshot restoration with manual-review guards for conflicts and external changes.
+- **Collaboration Analytics**: who sold whose products, Shopify Product Type, units, customer selling value, and each connected store's listing price **captured at sale time**.
+- **Competition Matrix**: Product Type × selling store, plus ranking by dropship units/revenue; uses **actual store names from Neon**, not internal A/B/C keys.
+- Inventory availability by **owner store × product type** from deduplicated owner inventory snapshots, with snapshot completeness warning.
+- **Store Settings**: add/edit/disable store, actual display name, Shopify domain, supplier identifier, owner details; no Vercel redeployment needed for these fields.
+- On-demand **webhook diagnosis and registration**, Shopify latest-orders comparison, exact SKU+supplier check, missing-order requeue/recovery, job logs.
+- Static dashboard in `public/index.html`, database-first reports, **zero browser polling**, once-daily recovery worker.
+- Shopify API tokens and webhook signing secrets remain in Vercel ENV, never database or browser.
+- One-time SQL schema migration; no concurrent `CREATE TABLE` from incoming serverless webhooks.
 
-## 1. Prerequisites
+## 1. Essential deployment caution
 
-- Node.js 20 or newer for local development.
-- Neon PostgreSQL database (or PostgreSQL-compatible connection URL).
-- A Shopify Admin API offline access token and appropriate API permission for each store.
-- A Vercel project using **Framework Preset: Other** (or a compatible Node.js host).
-- Correct Shopify app/webhook signing secret for each store.
+This application **cannot recover Shopify orders retroactively unless the relevant order still exists in Shopify and the Admin API token can access it**. Use read-only diagnostics first. Shopify product status is **product-level**; drafting a multi-variant product drafts all variants. Cancellation restoration uses captured location snapshots and can stop for manual review if stock is ambiguous. Test with separate Shopify development stores before changing real inventory.
 
-Required Shopify access depends on the operation: `read_products`, `write_products`, `read_inventory`, `write_inventory`, `read_orders`, `write_orders`. `read_reports` is required for ShopifyQL. Older than 60 days of order history may require the extra approval/scope `read_all_orders`. Protected customer data access and valid **offline** authentication may be required for order creation and original buyer details. Verify permissions in Shopify before enabling live writes.
+**Main fix for Store B not routing an order to Store A:** old v3 had no automatic confirmation of Store B webhook subscription. v3.1 exposes a diagnostic page that shows the store connection, recent Shopify orders, received webhook events, local processing state/error, owner matching, and a manual one-order recovery action. Do not assume root cause until these checks run.
 
-## 2. Install locally
+## 2. Install and first migration
 
 ```bash
-unzip StockBridge-v3.zip
-cd StockBridge-v3
+unzip StockBridge-v3.1.zip
+cd StockBridge-v3.1
 cp .env.example .env
 npm install
+npm run check
+npm test
+npm run db:migrate
+npm start
+```
+
+For an **existing v3 database**, first take a Neon backup/snapshot. **Run** `npm run db:migrate` **once**, preferably locally using a secure Neon connection, before shipping upgraded Vercel code. It adds `sb_stores`, `sb_sale_prices`, `sb_webhook_events`, and supporting indexes without deleting previous orders or snapshots. Script runs SQL in one transaction guarded by a PostgreSQL advisory lock. The previous per-request auto-creation of tables was removed to avoid:
+
+```text
+duplicate key value violates unique constraint "pg_type_typname_nsp_index"
+```
+
+If this error still appears, locate any other old Vercel deployment or app instance executing concurrent schema creation. Check Neon query logs and migrations. **Do not drop tables, schemas, types, or databases to resolve it.**
+
+### Vercel
+
+- Framework preset: **Other**; Node.js 20+.
+- Set `DATABASE_URL`, `ADMIN_USER`, long `ADMIN_PASSWORD`, `CRON_SECRET`, and store tokens/secrets in Project Settings → Environment Variables.
+- `vercel.json` rewrites **only `/api/*`** to Express. Root dashboard `public/index.html` is a CDN-served static file and makes no authenticated Shopify requests by itself.
+- Deploy from Git/ZIP source (or Vercel CLI). The `public/` directory must be retained.
+- On first visit, dashboard data requests use HTTP Basic authentication. Store metadata and sales JSON never ship in static HTML.
+- Default scheduler: `GET /api/worker` at `04:00 UTC` daily for stuck jobs. Vercel automatically attaches `Authorization: Bearer <CRON_SECRET>` if configured. A webhook attempts immediate processing using `waitUntil`, and daily sweep catches pending work later. On a plan allowing reliable more-frequent schedules, you may change this, at expense of extra invocations.
+
+## 3. Dashboard store setup (actual store names)
+
+Open **Manage Stores → Add / Edit Store**.
+
+| Field | Example for Store A | Example for Store B |
+|---|---|---|
+| Internal key (database/env only) | `A` | `B` |
+| Actual display name | `Store A` | `Store B` |
+| Shopify domain | `store-a.myshopify.com` | `store-b.myshopify.com` |
+| Ownership metafield value | `StoreA` | `StoreB` |
+| Owner contact email | `a@example.com` | `b@example.com` |
+| Owner shipping address | Enter in form | Enter in form |
+| Enabled | Yes | Yes |
+
+Only **internal key** is used for `STORE_A_ACCESS_TOKEN`, `STORE_A_WEBHOOK_SECRET`, etc. Real display names read from database everywhere in reports, and no personal names are hardcoded. Supplier lookup canonicalizes whitespace, dashes, underscores, and case: `StoreA` matches `Store A` when configured. SKU still must exactly match case-insensitively and uniquely with supplier.
+
+For a **new store**, enter Shopify access token + signing secret in Vercel environment variables once. Redeploy may be necessary for new secrets to reach running functions. After that, edit name, domain, supplier identifier, email, phone, address, enabled status through dashboard without redeployment. Setting tokens in database is deliberately **not** supported, minimizing credential exposure.
+
+Only **secrets and infrastructure bootstrap** stay in ENV: `DATABASE_URL`, `ADMIN_USER`, `ADMIN_PASSWORD`, `CRON_SECRET`, per-store `ACCESS_TOKEN` and `WEBHOOK_SECRET`. Never put DB connection or security master credentials in browser/dashboard settings.
+
+## 4. Verify Store B order webhook and fix missing order
+
+Example: Store B sold `WKT-342-UK-12-P` belonging to Store A, with `custom.supplier=StoreA`.
+
+1. Save Store A and Store B metadata in Manage Stores. Ensure both ENV token + HMAC secret set.
+2. Settings: enter public HTTPS app URL, e.g. `https://app.example.com`; save. Keep **DRY RUN** until diagnostics pass.
+3. **Order Diagnostics → select Store B → Test Store / Orders.** Compare recent Shopify orders with local `B:ORDER_ID` jobs. Missing means event was never saved locally (possible missing subscription, invalid HMAC, wrong Shopify domain, DB outage).
+4. Inspect missing `ORDERS_CREATE` / `ORDERS_CANCELLED` webhook subscriptions. Select **Install missing Webhooks**; requires Shopify API authorization. Note Shopify `webhookSubscriptions` returns only **shop-scoped** subscriptions, not app-scoped subscriptions configured in Shopify app TOML. App-scoped subscribers may already exist even if this screen says missing.
+5. Enter SKU `WKT-342-UK-12-P` and supplier `StoreA`. Check first with Store B, then Store A. Each must return exact matched SKU+supplier, correct product ID, location quantity. If no owner match, fix product metafields/listings first.
+6. Check Jobs & Error Logs. `ERROR` shows Shopify API failures; `DRY_RUN` means no inventory or supplier order writes occurred; `DONE` means processing reports success and should be reconciled with Shopify.
+7. If genuinely missing, **Recover** that Shopify order once from Store B's recent order list. This reads Shopify and requeues the existing order. No new supplier order will be created in DRY RUN. With LIVE writes, the worker can create real orders and zero stock; confirm manually first. Previous `ERROR` and `DRY_RUN` jobs can be explicitly retried. Completed `DONE` jobs are not reprocessed.
+8. Enable **LIVE** in Settings only after confirming scopes, webhooks, test orders, and cancellation behavior. Type `ENABLE` as prompted.
+
+Expected production sequence:
+
+```text
+Store B customer order
+  → Shopify ORDERS_CREATE to /api/webhooks (Store B signature)
+  → Neon job B:ORDER_ID
+  → read sold product from Store B; custom.supplier = StoreA
+  → find matching SKU + supplier on owner Store A (and Store C/D if listed)
+  → snapshot inventory / status / tags / per-store listed price
+  → reserve physical item, draft / remove stock on connected listings
+  → one internal order on Store A (discount from dashboard settings)
+  → internal-order tags prevent a second customer sale event
+  → sale ledger reflects ORIGINAL Store B revenue; internal order excluded
+  → Collaboration / Competition report reads Neon (no Shopify polling)
+```
+
+**If Shopify internal supplier order creation fails mid-workflow**, some listings might already be drafted; inspect job error and Shopify inventory manually. Do not repeatedly trigger `Recover` without comparing `ts_supplier_orders` and Shopify orders by the `TS_...` reference. The app prevents duplicate claims and searches reference tags, but Shopify mutation/network failures must be reconciled carefully.
+
+### Required Shopify access
+
+Offline Admin API token for each store and relevant scopes: `read_products`, `write_products`, `read_inventory`, `write_inventory`, `read_orders`, `write_orders`; ShopifyQL requires `read_reports` if used by optional legacy scripts. Older than 60 days of order history may require extra `read_all_orders` approval. Protected customer data permissions can apply. Webhook subscription management also requires that the app is allowed to create shop-scoped webhook subscriptions. Shopify API version defaults to `2026-10` and should be verified against the installation.
+
+Official reference: [webhookSubscriptionCreate](https://shopify.dev/docs/api/admin-graphql/latest/mutations/webhookSubscriptionCreate), [webhookSubscriptions](https://shopify.dev/docs/api/admin-graphql/latest/queries/webhookSubscriptions).
+
+## 5. Collaboration Analytics and price columns
+
+Only **genuine buyer-side sales** from `sb_sales` are counted. `is_internal=true`, `cancelled=true`, and owner=seller rows are excluded from dropshipping reports. Selling store names come from saved `sb_stores.display_name`.
+
+### Collaboration table
+
+| Selling store | Owner store | Product type | Sold units | Customer sale value | Store A listed value | Store B listed value | Store C listed value |
+|---|---|---|---:|---:|---:|---:|---:|
+| Store B | Store A | Crop Tops | 15 | 22,500 | 24,000 | 22,500 | 23,700 |
+
+*Example only.* `sb_sale_prices` snapshots linked stores' Shopify variant prices **when webhook job processes**; these are listing/catalog values, not necessarily realized sales. **No historical price reconstruction** is done. Older rows lacking a price snapshot show **N/A**, not 0. Prices from stores with different currencies must not be directly added or compared without FX conversion.
+
+### Competition matrix
+
+| Product type | Store A | Store B | Store C | Total |
+|---|---:|---:|---:|---:|
+| Crop Tops | 15 | 45 | 10 | 70 |
+
+Each cell counts products **sold on that store which belong to another store**, during selected date window. Rankings show dropship units and buyer-side sales. Buttons do **not** refresh periodically; they run on user action.
+
+### Available stock
+
+Owner-store physical SKU + supplier deduplicated. Available stock by owner+type comes from `sb_inventory` **only after an initial complete snapshot**. If missing/incomplete, table displays **Partial snapshot / N/A**, never an invented zero. Inventory is *current as of latest snapshot*; sold units are *selected reporting period*. Dashboard shows snapshot timestamps. No full live catalog scan occurs on report load.
+
+### Initial one-time catalog snapshot (local, avoids Vercel compute)
+
+After installing dependencies, for each enabled store on your own laptop/server:
+
+```bash
+STORE_KEY=A npm run sync:catalog
+STORE_KEY=B npm run sync:catalog
+STORE_KEY=C npm run sync:catalog
+STORE_KEY=D npm run sync:catalog
+```
+
+Each command resumes previous cursor (and internally reads Shopify product variants in bounded pages); runs **outside Vercel**, so it does not consume Vercel Function Invocations. The initial process reads full required lightweight inventory fields (SKU, supplier, category, brand, price, quantity), not all Shopify product data. Set `SYNC_RESET=true` explicitly only when a full refresh is intended; it may take time for large stores. Successful real-time order-processing updates already-stored stock rows. Changes outside StockBridge (manual Shopify stock edits/restocks) require an occasional snapshot refresh or future product/inventory webhooks.
+
+### Older sales
+
+For permitted history and when desired, run on a local machine:
+
+```bash
+STORE_KEY=A npm run backfill:orders
+STORE_KEY=B npm run backfill:orders
+```
+
+Store C/D likewise. Date range up to 12 months; Admin API older-order access is subject to Shopify permissions. **Backfill may be incomplete** if orders have more than 50 line items, were edited, or product metafield history is no longer available. The database stores lightweight sale rows, excluding internal supplier orders with known tags. Historical internal orders from prior app versions with unknown tags require manual exclusion. The app does not re-create historical cross-store catalog prices.
+
+## 6. Minimize Vercel usage
+
+Screenshot provided: **455K / 1M CDN requests; 427K / 1M Function Invocations; 1h 37m / 4h Fluid Active CPU; 2.32 GB / 10 GB Fast Origin Transfer** over displayed last-30-day window. Actual root cause of many requests requires Vercel route-level analytics/logs. Numbers alone do **not** prove dashboard or Shopify webhooks caused all invocations.
+
+v3.1 deliberately:
+
+- Serves dashboard static from Vercel CDN; **zero API invocations just to download HTML/CSS/JS**.
+- Uses **no client timers, setInterval, background dashboard refresh or Sync 200 products buttons**.
+- Calls a single database aggregation request when report opens or filters run. Store/settings/diagnostic API calls happen only when relevant tab opens or user clicks action.
+- Avoids Shopify Admin API requests for normal reports. Shopify calls happen for signed incoming webhooks, explicit diagnostics, recovery or optional local scripts.
+- Uses one lightweight 04:00 UTC daily cron check, approximately 30 Function Invocations/month; immediate processing attempts are tied to actual order webhook events.
+- Uses a small Neon connection pool. Never runs schema DDL per request.
+
+**Important:** A publicly reachable `/api/*` route can still be hit by bots and cause Vercel invocations even if Basic Auth rejects those calls. Check **Vercel Observability → Functions → top routes**, enable Deployment Protection where appropriate, configure Vercel Firewall/WAF or trusted-source restrictions. Do not block Shopify webhook deliveries. Rate-limit abusive paths at the edge, not by making extra Express calls. Shopify may also retry failed webhooks; fix 401/HMAC and 5xx errors so retries stop.
+
+## 7. Cancellation and recovery safety
+
+On buyer cancellation, StockBridge attempts canceling linked supplier-side synthetic orders, compares existing physical claims, restores stored inventory location quantities and product status/tags only where safe, marks original sale cancelled, and releases item claims. It can stop for manual review if stock changed elsewhere or restock would oversell. **Test both own-store and cross-store cancellation on development stores**. Never reset inventory to `1` blindly.
+
+## 8. Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| Store B order not recorded | Store B webhook subscription, exact Shopify domain, signing secret, 401/5xx deliveries, `B:ORDER_ID` job |
+| Job `ERROR` | Local job `last_error`, exact SKU+supplier on seller and owner, API permissions, owner inventory, 429/GraphQL userErrors |
+| Job `DRY_RUN` | Dashboard `LIVE` mode not enabled; recover after confirming settings |
+| Owner stock still ACTIVE | Whether Store B webhook exists, job created, owner SKU match, and supplier order mutation succeeded |
+| `pg_type_typname_nsp_index` | Stop old simultaneous schema init, run single migration with advisory lock; don't DROP database |
+| Settings store shows missing token | Add `STORE_X_ACCESS_TOKEN` and `STORE_X_WEBHOOK_SECRET` as Vercel secrets and deploy |
+| Stock available shows N/A | Local one-time initial snapshot not completed; use `sync:catalog` outside Vercel |
+| Old Store B orders missing from report | Inspect webhook history; run explicit authorized backfill locally or recover individual Shopify order |
+| Vercel high invocations | Check top routes, bot traffic, webhook delivery failures/retries, route-level protections |
+
+## 9. Scripts & files
+
+```text
+public/index.html                 static responsive reporting dashboard
+api/index.js                     single Express serverless handler
+src/app.js                       HMAC webhooks, auth, diagnostics, recovery, settings
+src/config.js                    ENV secrets and owner-identifier normalization
+src/stores.js                    PostgreSQL-managed store metadata
+src/db.js                        ledger, queues, snapshots, price persistence
+src/engine.js                    Shopify multi-store order routing/cancellation
+src/shopify.js                   GraphQL operations and webhook tools
+src/reports.js                   collaboration + competition SQL summaries
+src/report-utils.js              validated date filters
+src/analytics.js                 local one-time catalog/backfill utilities
+sql/migrate.sql                  one-time schema migration
+scripts/migrate.js               transactional/advisory-locked migration runner
+scripts/sync-catalog.js          one-time/on-demand local owner inventory import
+scripts/backfill-orders.js       manually executed historical sale backfill
+vercel.json                      static frontend + API only + daily cron
+.env.example                     minimal secrets template
+```
+
+## 10. Commands
+
+```bash
+npm run db:migrate
 npm run check
 npm test
 npm start
 ```
 
-Visit `http://localhost:3000`, then sign in using `ADMIN_USER` and `ADMIN_PASSWORD` from `.env`. Keep the `.env` file private; `.gitignore` excludes it. On first database-backed request, the app creates the required tables.
-
-## 3. Environment variables
-
-Copy `.env.example` and replace its placeholders. Do not commit real credentials.
-
-| Variable | Description |
-|---|---|
-| `DATABASE_URL` | Neon/Postgres connection string with SSL configuration |
-| `ADMIN_USER`, `ADMIN_PASSWORD` | HTTP Basic Auth for the dashboard and its APIs |
-| `CRON_SECRET` | Strong bearer secret for `/api/worker` |
-| `SHOPIFY_API_VERSION` | Admin GraphQL API version, `2026-10` by default; verify support for your stores |
-| `LIVE_WRITES` | **`false` by default**; no product/order changes in dry run |
-| `DEFAULT_DISCOUNT_PERCENT` | Default supplier-order discount, normally `99` |
-| `STORE_A_NAME` | Display name, e.g. `Store A` |
-| `STORE_A_URL` | Shopify admin domain, e.g. `store-a.myshopify.com` |
-| `STORE_A_SUPPLIER_NAME` | Expected value for ownership metafield `custom.supplier`, e.g. `Store A` |
-| `STORE_A_ACCESS_TOKEN` | Shopify Admin API offline token |
-| `STORE_A_WEBHOOK_SECRET` | Signing secret used to verify webhook HMAC |
-| `STORE_A_OWNER_EMAIL` | Supplier-order contact for Store A |
-| `STORE_A_OWNER_ADDRESS1`, `STORE_A_OWNER_CITY`, `STORE_A_OWNER_COUNTRY` | Supplier-order delivery/contact address |
-
-Repeat the same keys for Store B, Store C and Store D. Only fully configured stores should have a `STORE_X_URL` variable. Owners are found from **supplier metafield**, not tags alone. The same SKU can exist across stores, but each supplier/SKU combination should uniquely identify one physical thrift item.
-
-## 4. Prepare Shopify products
-
-For products shared across stores, use the same SKU and **product-level** `custom.supplier` value on every copy. Example: an item belonging to Store A uses `SKU=ITEM-001`, `custom.supplier=Store A` on Store A and Store B. `productType` determines category; optional `custom.brand` determines the brand grouping. StockBridge does not manufacture product copies; ensure source items and chosen copies exist in the participating stores.
-
-For best results, each one-off garment is a separate Shopify product with one inventory-tracked variant. Drafting a Shopify product hides **all its variants**; multi-variant products need deliberate testing. Multi-location inventory restoration is guarded and may require manual review.
-
-## 5. Configure webhooks
-
-Configure Shopify webhook subscriptions for each participating store:
-
-- **Order creation** (`orders/create`) → `https://YOUR-DOMAIN/api/webhooks`
-- **Order cancellation** (`orders/cancelled`) → the same endpoint.
-
-Use JSON delivery with Shopify's headers `X-Shopify-Shop-Domain`, `X-Shopify-Topic` and `X-Shopify-Hmac-Sha256`. Set the matching webhook signing secret for each store. Only valid signed webhook POST requests are accepted; browsing to the endpoint is not a valid webhook test. Verify the Shopify-app webhook configuration and permissions for each installation.
-
-Webhooks are queued into PostgreSQL, then processed asynchronously. Because serverless functions are ephemeral, add a scheduled worker call for reliable retries and cancellations.
-
-## 6. Worker and scheduling
-
-A scheduler should periodically call:
-
-```bash
-curl -H "Authorization: Bearer YOUR_CRON_SECRET" "https://YOUR-DOMAIN/api/worker?limit=3"
-```
-
-The included `vercel.cron-pro.example.json` illustrates a one-minute cron schedule for an eligible Vercel plan. Vercel Hobby and other plans have cron frequency/usage limitations; configure a compliant schedule. The app calls background workers after webhooks, but **do not rely only on background execution for reliable processing**. Review Vercel function duration and plan restrictions. The worker endpoint runs order jobs; also verify cancellation processing via app background execution before production and use Operations to track/retry failures.
-
-## 7. Dashboard workflow
-
-- **Overview:** current stock and sales summaries, connection health.
-- **Inventory & Sales Analytics:** select selling store, owner store, product type, brand, dates; compare available units, retail stock value, sold units and sales value. Export CSV.
-- **Dropshipping:** view cross-store sales grouped by owning supplier.
-- **Operations:** view jobs, errors, cancellations; run a bounded catalog sync (200 products per dashboard action); manually import past orders in batches and retry failed jobs.
-- **Settings:** edit supplier-order discount (0–100%), free internal shipping and analytics cache TTL (60–86,400 seconds). Changes affect **new** supplier orders, not existing ones.
-
-The dashboard serves data from an authenticated Express route, not a publicly accessible static folder.
-
-## 8. Initial stock sync and historical sales import
-
-Perform stock synchronization for **each** connected store from Operations; repeat until catalog traversal completes. From local CLI, the included bounded incremental scripts can iterate more pages:
-
-```bash
-STORE_KEY=A npm run sync:catalog
-STORE_KEY=B npm run sync:catalog
-STORE_KEY=A npm run backfill:orders
-STORE_KEY=B npm run backfill:orders
-```
-
-Repeat with C/D where enabled. The sales backfill requests up to 12 months; actual access depends on Shopify order-history authorization. Catalog sync is needed to populate stock summaries. The current available-stock figure is a **current** snapshot; the app cannot reconstruct arbitrary historical inventory levels from today's stock alone.
-
-## 9. Enabling live synchronization safely
-
-Keep `LIVE_WRITES=false` initially, and check `/api/status` with the dashboard login. Confirm store credentials, missing scopes, supplier metafields and matching SKU copies. Test a new order and webhook in a development store. Then review dry-run logs and the Operations dashboard. Only after making backups and verifying the specific test scenario, switch `LIVE_WRITES=true`, redeploy and test **one** item at a time.
-
-### Example A — owner sale
-
-Store A owns `ITEM-001` (`custom.supplier=Store A`). Customer buys it on Store A. Matching copies on the other stores are made unavailable/drafted, and the sold state is recorded. No additional supplier order should be created for Store A's own item.
-
-### Example B — reseller sale
-
-Store B lists Store A's `ITEM-001`. When a customer buys on Store B, StockBridge marks copies sold across connected stores and creates an internal supplier order on Store A for the selling-store contact. The supplier-order discount comes from Settings (default 99%), free shipping can be enabled, and internal tags prevent recursive processing. The original order reference is added to the supplier order.
-
-### Example C — cancellation
-
-When the customer order on Store B is cancelled, the app processes the cancellation event, attempts to cancel the internal supplier order, checks existing physical claims and restores listing snapshots only when safe. If the order was already fulfilled, the inventory location is ambiguous, or Shopify rejects cancellation, it records an error for manual review rather than blindly incrementing stock.
-
-**Concurrency warning:** Checkout can finish before the webhook arrives. Two simultaneous checkouts may happen before the first webhook is processed; database claims mitigate application duplicates but cannot reverse Shopify checkouts.
-
-## 10. Deployment to Vercel
-
-1. Unzip the source and commit the **contents of `StockBridge-v3/`** to a **private** GitHub repository. Do not commit `.env`.
-2. Import that repository to Vercel. Set Framework Preset **Other** and choose root where `package.json`, `vercel.json`, and `api/index.js` live.
-3. Create Neon PostgreSQL, store its connection string in Vercel `DATABASE_URL`.
-4. Add the variables from `.env.example` in Vercel's relevant environments. Set a real strong password and a unique cron secret.
-5. Deploy. Visit `https://YOUR-DOMAIN/health` (expects JSON) and the login-protected dashboard at `/`.
-6. Test `/api/status` from an authenticated dashboard, then configure webhooks on Shopify stores and verify delivery via Shopify and Vercel logs.
-7. Keep `LIVE_WRITES=false` until dry-run tests are correct, then enable and redeploy after validating one product end-to-end.
-8. Set up a recurring authenticated worker. Monitor Operations for failures.
-
-### Important endpoints
-
-| Route | Method | Access | Purpose |
-|---|---|---|---|
-| `/` | GET | Basic Auth | Dashboard |
-| `/health` | GET | Public | Basic readiness |
-| `/api/status` | GET | Basic Auth | Connections and recent jobs |
-| `/api/webhooks` | POST | Shopify HMAC | Orders/create and orders/cancelled |
-| `/api/worker?limit=3` | GET | `Bearer CRON_SECRET` | Queued order processing |
-| `/api/settings` | GET/PUT | Basic Auth | Discount/free shipping/cache |
-| `/api/analytics` | GET | Basic Auth | Aggregated reporting |
-| `/api/analytics/csv` | GET | Basic Auth | CSV export |
-| `/api/sync` | POST | Basic Auth | Bounded stock catalog sync |
-| `/api/backfill` | POST | Basic Auth | Bounded historical order import |
-| `/api/cancellations` | GET | Basic Auth | Cancellation tracking |
-| `/api/retry` | POST | Basic Auth | Requeue failed work |
-
-## 11. ShopifyQL analytics notes
-
-Your Shopify Analytics query is useful for supplier/product-type sales grouping. StockBridge removes `TOP 5` so supplier/category records are not intentionally truncated, and supports a brand-based grouping using `custom.brand`. Access through the Admin API is **not** guaranteed simply because the query runs in Shopify Admin Reports. Confirm `shopifyqlQuery` permissions (`read_reports`) and per-store compatibility. If unavailable, the dashboard uses locally imported sales events where present; mixed ShopifyQL `total_sales` and local gross line value can have **different definitions**. For consistent cross-store comparisons, complete and reconcile historical backfill. ShopifyQL may not support all metafield dimensions or metrics on every store.
-
-Current inventory uses cached SKU/variant stock levels. Selecting all selling stores deduplicates physical stock by supplier/SKU using the owner store. Stock valuation is based on Shopify **selling price**, not landed cost. Currency conversion is not performed between stores; compare numeric sales totals only where currencies are compatible.
-
-## 12. Tests and troubleshooting
-
-```bash
-npm run check
-npm test
-```
-
-The included logic tests cover matching, env parsing, webhook signatures, order/cancellation flows with mocked dependencies. These must be run after `npm install` on an actual environment. Real Shopify integration tests should additionally verify `orderCreate`, owner-order inventory reduction, 99% discount, free shipping, multi-location handling, historical reporting, and safe cancellation.
-
-- **401 API connection:** re-check exact `.myshopify.com` shop domain, valid offline Admin API token and granted scopes.
-- **403/401 webhook:** verify signing secret and raw-body HMAC; do not substitute Admin API token for secret.
-- **No jobs appear:** inspect Shopify webhook deliveries and Vercel logs.
-- **Unknown owner or duplicate SKU:** confirm product-level `custom.supplier` matches an enabled store, and that there is one unique SKU+supplier per store.
-- **PENDING or ERROR jobs:** check scheduler, permission errors and Operations; retry only after examining whether supplier orders already exist.
-- **Empty analytics:** run catalog sync and historical backfill for each store, or verify ShopifyQL access and reporting dimensions.
-- **Cancellation blocked:** verify fulfillment/refund state, location inventory and competing claims; manually reconcile as necessary.
-
-## 13. Security and operational limitations
-
-Keep credentials only in environment variables, use an isolated production database, and enable Neon backups. Webhook payloads and order customer information may be processed/stored temporarily in the DB. Apply retention and customer-data controls appropriate to applicable law and Shopify policy. HTTP Basic Auth should be used only over HTTPS. For larger teams, consider stronger user/session access control with per-user permissions and audit history.
-
-The source has **not** been confirmed against real Shopify credentials or a live Vercel deployment. The purchase, drafting, stock and cancellation paths should be treated as pre-production until validated with actual development stores. Ensure compliance with Vercel's hosting terms and your Shopify app's access permissions.
-
----
-
-**StockBridge v3** — one-of-a-kind inventory coordination for Store A, Store B, Store C and Store D.
+**Testing disclosure:** Node.js syntax tests and pure offline assertions can run without Shopify credentials; full `npm install`, existing integration-style unit suite and production Shopify API tests require dependencies and store authorization. No real Shopify order was modified by building this ZIP. Enable `LIVE` only after validating connected stores and testing safely.

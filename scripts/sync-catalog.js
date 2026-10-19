@@ -1,7 +1,7 @@
 import 'dotenv/config';
-import {getStores} from '../src/config.js';
+import {loadStores} from '../src/stores.js';
 import {syncCatalog} from '../src/analytics.js';
-const store=getStores().find(s=>s.key===String(process.env.STORE_KEY||'A'));
+const store=(await loadStores()).find(s=>s.key===String(process.env.STORE_KEY||'A'));
 if(!store){console.error('STORE_KEY is not an enabled Store A/B/C/D');process.exit(1)}
 try {
   let result, pages=0;

@@ -49,6 +49,11 @@ export async function processOrder(job, stores, deps={db,shopify,liveWrites}) {
       qty:Number(line.quantity),value:Number(line.price||soldVariant.price||0)*Number(line.quantity),
       currency:order.currency||order.presentment_currency||'PKR',cancelled:!!order.cancelled_at,internal:false});
   }
+  // Save exact per-store listing price at time of sale BEFORE mutation.
+  // These figures power cross-store price comparison without fetching catalogs per report.
+  if(database.saveSalePrice)for(const entry of entries)for(const [key, variant] of entry.variants){
+    await database.saveSalePrice(seller.key, String(order.id), String(entry.line.id||entry.line.variant_id),key,Number(variant.price||0), order.currency||'PKR');
+  }
   if (!live) {
     for (const entry of entries) await database.log(job.job_key,'INFO',`DRY RUN ${entry.sku}: owner ${entry.owner.key}; linked ${[...entry.variants.keys()].join(', ')}`);
     return {dryRun:true, items:entries.length};
@@ -83,6 +88,7 @@ export async function processOrder(job, stores, deps={db,shopify,liveWrites}) {
       if (!current) throw new Error(`Linked product disappeared from ${store.key}: ${entry.sku}`);
       const draftOnly=entry.owner.key!==seller.key && store.key===entry.owner.key;
       await api.markSold(store,current,saleTag,`${job.job_key}|${entry.key}`,{draftOnly});
+      await database.updateInventoryCache?.(store.key,current.id,0,'DRAFT');
       await database.log(job.job_key,'OK',`${store.key} ${entry.sku} + ${entry.owner.supplier}: DRAFT / ${saleTag} / ${draftOnly?'owner stock held for orderCreate':'Qty 0'}`);
     }
   }
@@ -118,6 +124,7 @@ export async function processOrder(job, stores, deps={db,shopify,liveWrites}) {
       const current=await api.findMatchingVariant(owner,e.sku,owner.supplier);
       if (!current) throw new Error(`Owner product disappeared after supplier order: ${e.sku}`);
       await api.markSold(owner,current,saleTag,`${job.job_key}|${e.key}`);
+      await database.updateInventoryCache?.(owner.key,current.id,0,'DRAFT');
     }
   }
   return {processed:entries.length,tag:saleTag};
@@ -130,7 +137,7 @@ export async function runQueue(stores, limit=3) {
     const job=await db.takeJob();
     if (!job) break;
     try {
-      const result=await processOrder(job,stores);
+      const result=await processOrder(job,stores,{db,shopify,liveWrites:await db.getSetting('liveWrites',false)});
       await db.finishJob(job.job_key,result.dryRun?'DRY_RUN':result.skipped?'SKIPPED':'DONE');
       await db.log(job.job_key,'OK',JSON.stringify(result));
       results.push({job:job.job_key,result});
@@ -143,8 +150,8 @@ export async function runQueue(stores, limit=3) {
   return results;
 }
 
-export async function runCancellations(stores,limit=2,deps={db,shopify,liveWrites}) {
-  const database=deps.db,api=deps.shopify,live=deps.liveWrites;
+export async function runCancellations(stores,limit=2,deps={db,shopify}) {
+  const database=deps.db,api=deps.shopify,live=deps.liveWrites ?? await database.getSetting('liveWrites',false);
   await database.ensureSchema();
   const results=[];
   for(let i=0;i<Math.min(10,limit);i++) {
@@ -181,6 +188,8 @@ export async function runCancellations(stores,limit=2,deps={db,shopify,liveWrite
         const owner=(await database.query('SELECT job_key FROM ts_claims WHERE item_key=$1',[snap.item_key])).rows[0];
         if(owner&&owner.job_key!==jobKey)throw new Error('Item now claimed by another order; manual review required');
         await api.restoreListing(store,snap.snapshot,saleTag,jobKey);
+        const restoredQty=Object.values(snap.snapshot.levels||{}).reduce((a,b)=>a+Number(b||0),0);
+        await database.updateInventoryCache?.(store.key,snap.snapshot.variantId,restoredQty,snap.snapshot.status);
         await database.log(jobKey,'OK',`Restored ${snap.sku||snap.snapshot.sku} on ${store.key}`);
       }
       await database.releaseClaims(jobKey);

@@ -42,11 +42,16 @@ export async function enqueue(storeKey, order) {
 export async function takeJob() {
   const r = await query(`UPDATE ts_jobs SET state='PROCESSING', attempts=attempts+1,
     locked_at=now(), updated_at=now() WHERE job_key = (
-    SELECT job_key FROM ts_jobs WHERE state='PENDING'
+    SELECT job_key FROM ts_jobs WHERE ((state='PENDING' OR state='RETRY') AND next_attempt <= now())
       OR (state='PROCESSING' AND locked_at < now()-interval '3 minutes')
     ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED)
     RETURNING *`);
   return r.rows[0];
+}
+export async function deferJob(jobKey,error,delayMinutes=2) {
+  await query(`UPDATE ts_jobs SET state='RETRY', last_error=$2, locked_at=NULL,
+      next_attempt=now()+($3::integer * interval '1 minute'),updated_at=now()
+      WHERE job_key=$1`,[jobKey,String(error).slice(0,1600),Math.max(1,Math.min(60,Math.ceil(delayMinutes)))]);
 }
 export async function finishJob(jobKey, state, error = null) {
   await query(`UPDATE ts_jobs SET state=$2,last_error=$3,locked_at=NULL,updated_at=now() WHERE job_key=$1`,
@@ -84,7 +89,11 @@ export async function claimAll(itemKeys, jobKey) {
       const inserted=await client.query(`INSERT INTO ts_claims(item_key,job_key) VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING job_key`,[itemKey,jobKey]);
       if (!inserted.rowCount) {
         const old=await client.query(`SELECT job_key FROM ts_claims WHERE item_key=$1`,[itemKey]);
-        if (old.rows[0]?.job_key!==jobKey) throw new Error(`CONFLICT: ${itemKey} claimed by ${old.rows[0]?.job_key}; both checkouts may already exist`);
+        if (old.rows[0]?.job_key!==jobKey) {
+          const error=new Error(`CONFLICT: ${itemKey} claimed by ${old.rows[0]?.job_key}; both checkouts may already exist. Review both Shopify orders before any manual release.`);
+          error.code='CLAIM_CONFLICT';
+          throw error;
+        }
       }
     }
     await client.query('COMMIT');

@@ -1,7 +1,7 @@
 {
   "name": "stockbridge-v3",
-  "version": "3.1.0",
-  "description": "Event driven cross-store Shopify orders, collaboration reporting and database-managed store settings",
+  "version": "3.2.0",
+  "description": "Webhook-driven multi-store Shopify dropshipping with durable claims, audited automation and collaboration reporting",
   "private": true,
   "type": "module",
   "engines": {

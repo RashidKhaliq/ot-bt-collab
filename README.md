@@ -1,4 +1,4 @@
-# StockBridge v3.1 — Multi-Store Dropshipping & Collaboration Analytics
+# StockBridge v3.2 — Automatic Webhook Order Routing & Safe Conflict Logging
 
 Node.js 20+ · Express · Vercel · Neon/PostgreSQL · Shopify Admin GraphQL
 
@@ -19,17 +19,69 @@ Node.js 20+ · Express · Vercel · Neon/PostgreSQL · Shopify Admin GraphQL
 - Shopify API tokens and webhook signing secrets remain in Vercel ENV, never database or browser.
 - One-time SQL schema migration; no concurrent `CREATE TABLE` from incoming serverless webhooks.
 
+
+## v3.2 — IMPORTANT: upgrade from v3.1
+
+This is a **source code release, not a live-shop deployment**. Backup your Neon production branch and save a PostgreSQL `pg_dump` before updating. Do **not** change production `DATABASE_URL` or drop `ts_claims`. Existing claims are intentional safeguards against physical-item double sales.
+
+1. `npm install` on development PC or clean CI machine (Node.js 20+).
+2. Run `npm run db:migrate` **once** against production Neon using the secure direct connection string. Adds `ts_jobs.next_attempt` and due-job index; does not delete existing data.
+3. Run `npm test` and `npm run check`. Run controlled test stores before production activation.
+4. Deploy source to Vercel. Keep existing token and webhook secret ENV values; set all store display names/domains/`custom.supplier` through dashboard.
+5. Settings → enable **LIVE** only when ready; previous database setting remains unchanged unless modified.
+6. Diagnostics → select EACH connected store; verify signed `orders/create` and `orders/cancelled` webhooks, current token scopes, callback `https://YOUR-APP-DOMAIN/api/webhooks`, and recent deliveries. App-scoped TOML subscriptions may not appear in shop-scoped list. Never create duplicate subscriptions without checking existing app-scoped subscriptions.
+7. Make one new Store B test purchase of Store A item. Expect Store B customer order → Store A discounted internal order → matching SKU+supplier on every connected store Qty 0 / DRAFT / `Soldby_<ActualSellerName>`. Cancel test customer order and verify supplier cancellation and cautious stock restoration.
+
+### Automatic processing; no Recover button required for new successful orders
+
+- Shopify sends signed JSON webhook. Handler verifies domain+HMAC and saves pending job in Neon before HTTP 200 acknowledgment. Registers a Vercel `waitUntil()` background worker **before** response, which attempts one queued order and one cancellation.
+- Owner decided from **source-selling-store product metafield** `custom.supplier` (not SKU alone). If supplier maps back to seller, no internal order created. Otherwise, matching owner SKU+supplier is required; seller order placed on **owner** with dashboard discount (default 99%), internal tag, free-shipping settings, original order reference. New internal webhook is ignored and logged.
+- After owner order exists, all matching connected listings are tagged `Soldby_<seller's configured display name>`, set to `DRAFT`, and inventory `0`. Owners keep own internal order quantity adjustment; linked stores update individually.
+- Durable claim prevents two legitimate Shopify checkouts selling same physical piece **after both checkouts already happened**. Webhooks cannot prevent a concurrent oversell at checkout time. Never force-create a second supplier order from `CONFLICT` state.
+- Dashboard → Diagnostics → **Recent Jobs & Error Logs** → **Details** shows signed webhook deliveries, job status, step-by-step timeline, owner internal order IDs, snapshot references, claimed SKU, and conflict holder. No background dashboard polling.
+- `RETRY` = transient network/API error. `REVIEW` = Shopify order-create network timeout where order might already exist; **do not retry blindly**. `CONFLICT` = another customer checkout currently owns physical claim; investigate both original orders and owner orders. `ERROR` = validation/API failure. `DONE` = completed. `DRY_RUN` = actual stock/order writes disabled.
+- HTTP webhook processing occurs on receipt. Retry sweep on Vercel Hobby default scheduler is **daily only**: if Shopify API temporarily fails, a `RETRY` job will wait until next worker invocation or scheduled check. For reliable frequent recovery, set up an **optional externally scheduled authenticated GET `/api/worker`** (example every 10–15 minutes) or a reliable queue service; this incurs extra invocations and must preserve `Authorization: Bearer <CRON_SECRET>`. Vercel Hobby cannot schedule native cron more than once per day. Avoid unauthenticated public worker endpoints.
+
+### Conflict example & safe review
+
+If a job reports:
+
+```text
+CONFLICT: A:wts10uk4p claimed by B:6721133379772; both checkouts may already exist
+```
+
+it means current sale and previously claimed order point to **same physical-item key**. Check **both** Shopify customer orders, the previous job `B:6721133379772`, owner internal order, snapshot, and any cancellation. New supplier order is **deliberately blocked** to prevent duplicate fulfillment of one-off stock. Do not `DELETE FROM ts_claims` or change claim key simply to bypass error. After appropriate cancellation and successful StockBridge restoration, existing claim is released automatically. If previous job was a partial failure or source order is no longer valid, reconcile manually; do not guess inventory.
+
+Read-only SQL diagnostics for Neon SQL Editor (not data-changing):
+
+```sql
+SELECT item_key,job_key,claimed_at FROM ts_claims WHERE item_key='A:wts10uk4p';
+SELECT job_key,selling_key,order_name,state,attempts,last_error,created_at FROM ts_jobs WHERE job_key='B:6721133379772';
+SELECT owner_key,owner_order_gid FROM ts_supplier_orders WHERE job_key='B:6721133379772';
+SELECT level,message,created_at FROM ts_logs WHERE job_key='B:6721133379772' ORDER BY id;
+```
+
+### Webhook and jobs troubleshooting
+
+- **No Store B webhook delivery:** check Store B webhook subscription URL, signing secret, correct `.myshopify.com` domain, access token, Shopify webhook delivery history. A webhook cannot process orders if Shopify never sends it or HMAC rejects it.
+- **Webhook received; job absent:** inspect Neon connection and Vercel Functions error logs (webhook should return 2xx only after queue insert succeeds).
+- **Job PENDING:** `waitUntil` did not finish/start; trigger secure worker, review Vercel timeout and function logs.
+- **Job DRY_RUN:** Settings → LIVE writes is off; recover existing dry-run order explicitly after enabling it. Do not confuse absence of owner order with webhook failure.
+- **Job ERROR:** inspect step logs and Shopify GraphQL error, scopes or inventory. An explicit recover is only needed for old/failed orders; new ordinary orders auto-trigger.
+- **Job REVIEW/CONFLICT:** resolve both Shopify orders and their physical stock claim before retry. Never force duplicate supplier orders.
+
+
 ## 1. Essential deployment caution
 
 This application **cannot recover Shopify orders retroactively unless the relevant order still exists in Shopify and the Admin API token can access it**. Use read-only diagnostics first. Shopify product status is **product-level**; drafting a multi-variant product drafts all variants. Cancellation restoration uses captured location snapshots and can stop for manual review if stock is ambiguous. Test with separate Shopify development stores before changing real inventory.
 
-**Main fix for Store B not routing an order to Store A:** old v3 had no automatic confirmation of Store B webhook subscription. v3.1 exposes a diagnostic page that shows the store connection, recent Shopify orders, received webhook events, local processing state/error, owner matching, and a manual one-order recovery action. Do not assume root cause until these checks run.
+**Store B not routing an order to Store A:** older releases lacked clear confirmation of Store B webhook subscriptions. v3.2 exposes a diagnostic page that shows the store connection, recent Shopify orders, received webhook events, local processing state/error, owner matching, and a manual one-order recovery action. Do not assume root cause until these checks run.
 
 ## 2. Install and first migration
 
 ```bash
-unzip StockBridge-v3.1.zip
-cd StockBridge-v3.1
+unzip StockBridge-v3.2-Auto-Orders.zip
+cd StockBridge-v3.2
 cp .env.example .env
 npm install
 npm run check
@@ -53,7 +105,7 @@ If this error still appears, locate any other old Vercel deployment or app insta
 - `vercel.json` rewrites **only `/api/*`** to Express. Root dashboard `public/index.html` is a CDN-served static file and makes no authenticated Shopify requests by itself.
 - Deploy from Git/ZIP source (or Vercel CLI). The `public/` directory must be retained.
 - On first visit, dashboard data requests use HTTP Basic authentication. Store metadata and sales JSON never ship in static HTML.
-- Default scheduler: `GET /api/worker` at `04:00 UTC` daily for stuck jobs. Vercel automatically attaches `Authorization: Bearer <CRON_SECRET>` if configured. A webhook attempts immediate processing using `waitUntil`, and daily sweep catches pending work later. On a plan allowing reliable more-frequent schedules, you may change this, at expense of extra invocations.
+- Default scheduler: `GET /api/worker` at `04:00 UTC` daily for stuck jobs. Vercel automatically attaches `Authorization: Bearer <CRON_SECRET>` if configured. A webhook attempts immediate processing using `waitUntil`, and daily sweep can recover some pending or transiently failed jobs later. Full reliability and short retry times require an external durable scheduler/queue; `waitUntil` alone can be cut short by function timeouts. On a plan allowing reliable more-frequent schedules, you may change this, at expense of extra invocations.
 
 ## 3. Dashboard store setup (actual store names)
 
@@ -97,14 +149,15 @@ Store B customer order
   → read sold product from Store B; custom.supplier = StoreA
   → find matching SKU + supplier on owner Store A (and Store C/D if listed)
   → snapshot inventory / status / tags / per-store listed price
-  → reserve physical item, draft / remove stock on connected listings
-  → one internal order on Store A (discount from dashboard settings)
+  → reserve physical item (claim) and capture full snapshots
+  → one internal order on Store A FIRST (discount from dashboard settings)
+  → draft / remove stock across Store A, B and linked C/D listings
   → internal-order tags prevent a second customer sale event
   → sale ledger reflects ORIGINAL Store B revenue; internal order excluded
   → Collaboration / Competition report reads Neon (no Shopify polling)
 ```
 
-**If Shopify internal supplier order creation fails mid-workflow**, some listings might already be drafted; inspect job error and Shopify inventory manually. Do not repeatedly trigger `Recover` without comparing `ts_supplier_orders` and Shopify orders by the `TS_...` reference. The app prevents duplicate claims and searches reference tags, but Shopify mutation/network failures must be reconciled carefully.
+**v3.2 order of operations:** Verify source line `SKU + custom.supplier`, find exact owner listing, obtain unique physical-item claim, save location/status snapshots, create internal order on owner store first (unless owner sold own item), then zero available inventory and DRAFT the matching listing on every connected store. A failed owner `orderCreate` no longer drafts linked products in a new attempt. A later Shopify write can still fail mid-operation; inspect logged steps and reconcile carefully. `StockBridgeInternal`/`Dropshipped_Order` tags prevent recursive supplier orders. Never repeatedly create an internal order without checking the original `TS_...` reference. Input `orderCreate` mutation requires offline-token access with proper `write_orders` scope.
 
 ### Required Shopify access
 
@@ -164,7 +217,7 @@ Store C/D likewise. Date range up to 12 months; Admin API older-order access is 
 
 Screenshot provided: **455K / 1M CDN requests; 427K / 1M Function Invocations; 1h 37m / 4h Fluid Active CPU; 2.32 GB / 10 GB Fast Origin Transfer** over displayed last-30-day window. Actual root cause of many requests requires Vercel route-level analytics/logs. Numbers alone do **not** prove dashboard or Shopify webhooks caused all invocations.
 
-v3.1 deliberately:
+v3.2 deliberately:
 
 - Serves dashboard static from Vercel CDN; **zero API invocations just to download HTML/CSS/JS**.
 - Uses **no client timers, setInterval, background dashboard refresh or Sync 200 products buttons**.
@@ -225,3 +278,12 @@ npm start
 ```
 
 **Testing disclosure:** Node.js syntax tests and pure offline assertions can run without Shopify credentials; full `npm install`, existing integration-style unit suite and production Shopify API tests require dependencies and store authorization. No real Shopify order was modified by building this ZIP. Enable `LIVE` only after validating connected stores and testing safely.
+
+## v3.2 validation notes
+
+- Included test suite covers owner/seller resolution, internal-order prevention, owner-first creation order, zero-stock mutation request, discount settings, conflict states, and safe retry classification.
+- `npm test` uses mock Shopify responses and injected database behavior. Run it **with installed project dependencies**. Deployment and real Shopify/Neon integration tests were **not** executed as part of package creation.
+- `node --check` covers server modules. The embedded static dashboard script can also be checked with a JS parser. `npm install` and actual Vercel build must pass before production promotion.
+- `orderCreate` uses offline Shopify Admin API tokens with `write_orders` and product/inventory permissions. Verify scope setup in each store and webhook registrations.
+- If a transaction has an ambiguous Shopify `orderCreate` network failure, mark `REVIEW` and verify Shopify order reference before allowing any rerun. This avoids creating two supplier orders for same customer order.
+- Emergency recovery needs human confirmation. Do not disable claim checks, forcibly set available stock, or change existing database rows to bypass inventory conflicts.

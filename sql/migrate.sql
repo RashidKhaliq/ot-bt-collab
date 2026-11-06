@@ -80,3 +80,7 @@ CREATE TABLE IF NOT EXISTS sb_order_checks (
  last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
  PRIMARY KEY(store_key,order_id)
 );
+
+-- v3.2 durable retry scheduling. Migration only, never webhook-time schema creation.
+ALTER TABLE ts_jobs ADD COLUMN IF NOT EXISTS next_attempt TIMESTAMPTZ NOT NULL DEFAULT now();
+CREATE INDEX IF NOT EXISTS ts_jobs_retry_due ON ts_jobs (state,next_attempt,created_at);

@@ -20,7 +20,7 @@ function auth(req,res,next){const user=process.env.ADMIN_USER,pass=process.env.A
  res.set('WWW-Authenticate','Basic realm="StockBridge"');return res.status(401).json({error:'Admin login required'})}
  next()}
 function csrf(req,res,next){const origin=req.get('Origin');if(origin){try{if(new URL(origin).host!==req.get('host'))return res.status(403).json({error:'Invalid request origin'})}catch{return res.status(403).json({error:'Bad Origin'})}}next()}
-async function worker(){const stores=await loadStores({refresh:true});return {orders:await runQueue(stores,3),cancellations:await runCancellations(stores,3)}}
+async function worker(){const stores=await loadStores({refresh:true});return {orders:await runQueue(stores,1),cancellations:await runCancellations(stores,1)}}
 function scheduleWorker(){const task=worker().catch(e=>console.error('Background job:',e.message));try{waitUntil(task)}catch{task.catch(()=>{})}}
 
 // Accept ONLY authentic Shopify requests. Every connected store gets its own secret.
@@ -33,10 +33,17 @@ app.post('/api/webhooks',express.raw({type:'*/*',limit:'2mb'}),safe(async(req,re
  if(!['orders/create','orders/cancelled'].includes(topic))return res.status(200).json({ok:true,ignored:topic});
  let order;try{order=JSON.parse(req.body.toString('utf8'))}catch{return res.status(400).json({error:'Invalid JSON'})}
  if(!order.id)return res.status(422).json({error:'Missing order id'});
- if(isInternalOrder(order))return res.json({ok:true,ignored:'internal order'});
+ if(isInternalOrder(order)){
+   const id=`${store.key}:${String(order.id)}`;
+   await db.log(id,'IGNORED',`INTERNAL OWNER ORDER: ${store.name}; original order tag detected; no recursive fulfillment`);
+   return res.json({ok:true,ignored:'internal order'});
+ }
  const jobKey=topic==='orders/create'?await db.enqueue(store.key,order):await db.enqueueCancel(null,store.key,order);
  try{await db.recordWebhook(String(req.header('X-Shopify-Webhook-Id')||req.header('X-Shopify-Event-Id')||''),store.key,topic,order.id)}catch(e){console.warn('Webhook audit insert failed:',e.message)}
- res.status(200).json({ok:true,queued:jobKey,store:store.key});scheduleWorker();
+ await db.log(jobKey,'WEBHOOK',`RECEIVED ${topic} | ${store.name} | order ${order.name||order.id} | ${(order.line_items||[]).map(l=>l.sku).filter(Boolean).join(', ')}`);
+ // Register background work BEFORE acknowledging webhook response.
+ scheduleWorker();
+ res.status(200).json({ok:true,queued:jobKey,store:store.key});
 }));
 app.get('/api/worker',safe(async(req,res)=>{
  if(!process.env.CRON_SECRET||req.header('Authorization')!==`Bearer ${process.env.CRON_SECRET}`)return res.status(401).json({error:'Unauthorized'});
@@ -71,7 +78,7 @@ app.get('/api/stores/:key/diagnostics',safe(async(req,res)=>{
  if(connection){try{webhooks=await getWebhookSubscriptions(s)}catch(e){warnings.push('Webhook list unavailable: '+e.message)}
    try{orders=await recentShopifyOrders(s,10)}catch(e){warnings.push('Recent orders unavailable: '+e.message)}}
  const watchedIds=orders.map(o=>`${s.key}:${o.id}`);
- const jobs=watchedIds.length?(await db.query('SELECT job_key,state,last_error FROM ts_jobs WHERE job_key = ANY($1::text[])',[watchedIds])).rows:[];
+ const jobs=watchedIds.length?(await db.query('SELECT job_key,state,last_error,attempts,next_attempt FROM ts_jobs WHERE job_key = ANY($1::text[])',[watchedIds])).rows:[];
  const jobMap=new Map(jobs.map(j=>[j.job_key,j]));
  const uri=String(await db.getSetting('publicUrl','')).replace(/\/$/,'')+'/api/webhooks';
  const seen=(await db.query('SELECT topic,received_at,order_id FROM sb_webhook_events WHERE store_key=$1 ORDER BY received_at DESC LIMIT 10',[s.key])).rows;
@@ -95,16 +102,43 @@ app.post('/api/recover',csrf,safe(async(req,res)=>{
  if(original.cancelled_at||isInternalOrder(original))return res.status(409).json({error:'Cancelled/internal order; not eligible for recovery'});
  const jobKey=await db.enqueue(s.key,original);
  const found=(await db.query('SELECT state,last_error FROM ts_jobs WHERE job_key=$1',[jobKey])).rows[0];
+ if(['CONFLICT','REVIEW'].includes(found?.state))return res.status(409).json({error:`${found.state}: review claim/order details before retrying. ${found.last_error||''}`});
  // Existing ERROR jobs can be explicitly retried, never auto-resend a DONE job.
  if(['ERROR','DRY_RUN'].includes(found?.state))await db.query("UPDATE ts_jobs SET state='PENDING',last_error=NULL,updated_at=now() WHERE job_key=$1 AND state IN ('ERROR','DRY_RUN')",[jobKey]);
  scheduleWorker();res.json({ok:true,jobKey,previousStatus:found?.state||'new'});
 }));
 app.get('/api/jobs',safe(async(req,res)=>{
  const [jobs,logs,events]=await Promise.all([
- db.query('SELECT job_key,selling_key,order_name,state,attempts,last_error,created_at FROM ts_jobs ORDER BY created_at DESC LIMIT 30'),
- db.query('SELECT job_key,level,message,created_at FROM ts_logs ORDER BY id DESC LIMIT 30'),
- db.query('SELECT store_key,topic,received_at FROM sb_webhook_events ORDER BY received_at DESC LIMIT 20')]);
+ db.query('SELECT job_key,selling_key,order_name,state,attempts,last_error,next_attempt,created_at FROM ts_jobs ORDER BY created_at DESC LIMIT 60'),
+ db.query('SELECT id,job_key,level,message,created_at FROM ts_logs ORDER BY id DESC LIMIT 150'),
+ db.query('SELECT store_key,topic,order_id,received_at FROM sb_webhook_events ORDER BY received_at DESC LIMIT 50')]);
  res.json({jobs:jobs.rows,logs:logs.rows,events:events.rows});
+}));
+// Read-only conflict investigation: never delete a claim automatically.
+app.get('/api/jobs/:jobKey/detail',safe(async(req,res)=>{
+ const key=String(req.params.jobKey||'');
+ if(!/^[A-Z0-9]+:\d+$/.test(key))return res.status(422).json({error:'Invalid job key'});
+ const [job,steps,claims,orders,snapshots,cancel]=await Promise.all([
+  db.query('SELECT job_key,selling_key,order_id,order_name,state,attempts,last_error,next_attempt,created_at,updated_at FROM ts_jobs WHERE job_key=$1',[key]),
+  db.query('SELECT id,level,message,created_at FROM ts_logs WHERE job_key=$1 ORDER BY id ASC LIMIT 300',[key]),
+  db.query(`SELECT c.item_key,c.job_key,j.state,j.order_name,j.selling_key,j.created_at
+    FROM ts_claims c JOIN ts_jobs j ON j.job_key=c.job_key
+    WHERE c.job_key=$1 OR c.item_key IN
+      (SELECT item_key FROM ts_claims WHERE job_key=$1) ORDER BY c.item_key LIMIT 100`,[key]),
+  db.query('SELECT owner_key,owner_order_gid,created_at FROM ts_supplier_orders WHERE job_key=$1',[key]),
+  db.query('SELECT store_key,item_key FROM sb_snapshots WHERE job_key=$1 LIMIT 100',[key]),
+  db.query('SELECT state,last_error,created_at FROM sb_cancellations WHERE job_key=$1',[key])
+ ]);
+ if(!job.rows.length)return res.status(404).json({error:'Job not found'});
+ const context=String(job.rows[0].last_error||'');
+ const conflictingJobKey=context.match(/claimed by ([A-Z0-9]+:\d+)/)?.[1];
+ let conflict=null;
+ if(conflictingJobKey){
+   const row=await db.query('SELECT job_key,selling_key,order_name,state,created_at FROM ts_jobs WHERE job_key=$1',[conflictingJobKey]);
+   conflict=row.rows[0]||{job_key:conflictingJobKey};
+ }
+ res.json({job:job.rows[0],steps:steps.rows,claims:claims.rows,ownerOrders:orders.rows,
+   snapshots:snapshots.rows,cancellation:cancel.rows[0]||null,conflict});
 }));
 app.post('/api/jobs/process',csrf,safe(async(req,res)=>res.json({ok:true,results:await worker()})));
 app.post('/api/jobs/retry',csrf,safe(async(req,res)=>{
@@ -121,5 +155,5 @@ app.get('/api/stores/:key/check-sku',safe(async(req,res)=>{
  res.json({store:s.name,found:!!matched,product:matched&&{id:matched.product.id,status:matched.product.status,
    supplier:matched.product.metafield?.value,price:matched.price,quantity:matched.inventoryItem?.inventoryLevels?.nodes?.reduce((acc,l)=>acc+Number(l.quantities?.[0]?.quantity||0),0),tags:matched.product.tags}});
 }));
-app.get('/api/version',(req,res)=>res.json({name:'StockBridge',version:'3.1.0'}));
+app.get('/api/version',(req,res)=>res.json({name:'StockBridge',version:'3.2.0'}));
 export default app;

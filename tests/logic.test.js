@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getStores, soldTag } from '../src/config.js';
-import { getOwner, physicalKey, isInternalOrder, processOrder } from '../src/engine.js';
+import { getOwner, physicalKey, isInternalOrder, processOrder, classifyOrderError, runQueue } from '../src/engine.js';
 import { createSupplierOrder, makeVariantSearch, markSold, graphql } from '../src/shopify.js';
 
 const stores=[
@@ -67,7 +67,7 @@ test('reseller sale creates supplier order once, then drafts all linked listings
   assert.equal(created[0].owner.key,'A');
   assert.equal(created[0].seller.key,'B');
   assert.equal(created[0].lines[0].variantId,'gid://shopify/ProductVariant/1');
-  assert.deepEqual(updates.map(x=>x.store),['A','B','A','A','B','A']);
+  assert.deepEqual(updates.map(x=>x.store),['A','B','A','B']);
   assert.ok(updates.every(x=>x.tag==='Soldby_Selling_Store'));
 });
 test('dry-run never claims inventory or writes to Shopify',async()=>{
@@ -136,4 +136,64 @@ test('missing owner listing blocks writes rather than matching SKU alone',async(
   deps.shopify.findMatchingVariant=async(store)=>store.key==='A'?null:variant();
   await assert.rejects(processOrder({job_key:'B:101',selling_key:'B',payload:sourceOrder},stores,deps),/does not have matching SKU/);
   assert.equal(updates.length,0);assert.equal(created.length,0);
+});
+
+test('owner order is created before any linked product is drafted',async()=>{
+  const {deps,updates,created}=fakeDeps('B');
+  deps.shopify.createSupplierOrder=async (...args)=>{
+    assert.equal(updates.length,0,'No linked store inventory/status changed before owner order exists');
+    created.push(args);return 'gid://shopify/Order/22';
+  };
+  await processOrder({job_key:'B:101',selling_key:'B',payload:sourceOrder},stores,deps);
+  assert.equal(created.length,1);
+  assert.deepEqual(updates.map(x=>x.store),['A','B']);
+});
+test('supplier order GraphQL error does not draft linked products',async()=>{
+  const {deps,updates}=fakeDeps('B');
+  deps.shopify.createSupplierOrder=async()=>{throw new Error('GraphQL invalid owner order fields')};
+  await assert.rejects(processOrder({job_key:'B:101',selling_key:'B',payload:sourceOrder},stores,deps),/invalid owner order/);
+  assert.equal(updates.length,0);
+});
+test('claim conflict classified as blocking, never auto retried',()=>{
+  const err=new Error('CONFLICT: A:wkt342uk12p claimed by B:100; both checkouts may already exist');
+  err.code='CLAIM_CONFLICT';
+  assert.equal(classifyOrderError(err),'CONFLICT');
+  assert.equal(classifyOrderError(Object.assign(new Error('Request timed out'),{code:'UNCERTAIN_CREATE'})),'REVIEW');
+  assert.equal(classifyOrderError(new Error('Shopify network ETIMEDOUT')),'RETRY');
+});
+test('durable worker keeps conflict in CONFLICT and logs it',async()=>{
+ const saved=[],logs=[];let count=0;
+ const database={
+   ensureSchema:async()=>{},takeJob:async()=>count++===0?{job_key:'B:101',selling_key:'B',payload:sourceOrder,attempts:1,order_name:'#101'}:null,
+   cancelledOrPending:async()=>false,log:async(...x)=>logs.push(x),getSetting:async()=>true,
+   upsertSale:async()=>{},saveSalePrice:async()=>{},
+   claimAll:async()=>{const e=new Error('CONFLICT: A:abc100 claimed by A:555; both checkouts may already exist');e.code='CLAIM_CONFLICT';throw e},
+   finishJob:async(...x)=>saved.push(x)
+ };
+ const api={fetchSourceVariant:async()=>variant('ABC-100','Store A','2'),
+  findMatchingVariant:async(store)=>variant('ABC-100','Store A',store.key==='A'?'1':'2')};
+ const r=await runQueue(stores,1,{db:database,shopify:api,liveWrites:true});
+ assert.equal(r[0].state,'CONFLICT');
+ assert.deepEqual(saved[0].slice(0,2),['B:101','CONFLICT']);
+ assert.equal(logs.some(x=>x[1]==='CONFLICT'),true);
+});
+test('transient network error becomes RETRY with scheduled retry',async()=>{
+ const saved=[],deferred=[];let count=0;
+ const database={
+  ensureSchema:async()=>{},takeJob:async()=>count++===0?{job_key:'B:101',selling_key:'B',payload:sourceOrder,attempts:1,order_name:'#101'}:null,
+  cancelledOrPending:async()=>false,log:async()=>{},getSetting:async()=>true,
+  deferJob:async(...x)=>deferred.push(x),finishJob:async(...x)=>saved.push(x)
+ };
+ const api={fetchSourceVariant:async()=>{throw new Error('network timeout')}};
+ const r=await runQueue(stores,1,{db:database,shopify:api,liveWrites:true});
+ assert.equal(r[0].state,'RETRY');assert.equal(deferred.length,1);assert.equal(saved.length,0);
+});
+test('uncertain owner orderCreate triggers REVIEW and no automatic retry',async()=>{
+ const {deps,updates}=fakeDeps('B');
+ deps.shopify.createSupplierOrder=async()=>{throw new Error('Shopify network timeout')};
+ await assert.rejects(async()=>{
+   try {await processOrder({job_key:'B:101',selling_key:'B',payload:sourceOrder},stores,deps)}
+   catch(e){assert.equal(classifyOrderError(e),'REVIEW');throw e}
+ },/possible supplier order/);
+ assert.equal(updates.length,0);
 });

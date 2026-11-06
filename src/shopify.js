@@ -131,8 +131,10 @@ export function referenceTag(storeKey,orderId,ownerKey) {
   return 'TS_' + crypto.createHash('sha256').update(`${storeKey}:${orderId}:${ownerKey}`).digest('hex').slice(0,20);
 }
 export async function findExistingSupplierOrder(store, reference) {
-  const result=await graphql(store,`query($q:String!){orders(first:2,query:$q){nodes{id tags}}}`,{q:`tag:${reference}`});
-  return result.orders.nodes.find(o=>o.tags.includes(reference))?.id||null;
+  const result=await graphql(store,`query($q:String!){orders(first:10,query:$q){nodes{id tags cancelledAt}}}`,{q:`tag:${reference}`});
+  const match=result.orders.nodes.find(o=>o.tags.includes(reference) && !o.cancelledAt);
+  if(!match && result.orders.nodes.some(o=>o.tags.includes(reference)))throw new Error('Owner order for this reference was cancelled; manual review required');
+  return match?.id||null;
 }
 function noteForOrder(seller, originalOrder, ownerKey, lines, discount=99, freeShipping=true) {
   const c=originalOrder.customer||{};
